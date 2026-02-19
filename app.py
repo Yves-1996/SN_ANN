@@ -53,7 +53,7 @@ def run_analysis():
     )
     
     # Entraînement rapide pour la démo (ou chargement de modèle)
-    m.fit(df, freq="B") 
+    m.fit(df, freq="B", learning_rate=0.01) 
 
     # 3. Prévisions Futures (Hybride)
     future = m.make_future_dataframe(df, periods=5, n_historic_predictions=False)
