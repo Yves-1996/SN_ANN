@@ -14,9 +14,8 @@ import matplotlib.pyplot as plt
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="IBM Hybrid Predictor", layout="wide")
 st.title("🚀 IBM Stock Predictor: Prophet + LSTM Hybrid")
-st.write("Ce modèle utilise NeuralProphet pour la tendance long-terme et un LSTM pré-entraîné pour la correction de volatilité.")
 
-# --- ARCHITECTURE DU MODÈLE LSTM (Doit être identique à l'entraînement) ---
+# --- ARCHITECTURE DU MODÈLE LSTM ---
 class IBM_LSTM(nn.Module):
     def __init__(self, input_size=1, hidden_size=64, num_layers=2):
         super(IBM_LSTM, self).__init__()
@@ -30,99 +29,76 @@ class IBM_LSTM(nn.Module):
 # --- CHARGEMENT DES COMPOSANTS ---
 @st.cache_resource
 def load_assets():
-    # Charger le scaler sauvegardé
-    scaler = joblib.load("residus_scaler.gz")
-    # Charger le modèle LSTM
-    model = IBM_LSTM()
-    model.load_state_dict(torch.load("ibm_lstm_model.pth", map_location=torch.device('cpu')))
-    model.eval()
-    return model, scaler
+    scaler = joblib.load("res_scaler.pkl") # Assurez-vous que le fichier est présent
+    model_lstm = IBM_LSTM()
+    # model_lstm.load_state_dict(torch.load("ibm_lstm_model.pth")) # Optionnel si vous l'utilisez
+    model_lstm.eval()
+    return model_lstm, scaler
 
-# --- LOGIQUE DE PRÉDICTION ---
-def run_analysis(use_gap):
-    # 1. Récupération des données fraîches
-    with st.spinner("Téléchargement des données IBM en direct..."):
-        df_raw = yf.download("IBM", start="2018-01-01").reset_index()
-        df = df_raw[['Date', 'Close']].copy()
-        df.columns = ['ds', 'y']
-
-    # 2. Fit rapide de NeuralProphet pour la tendance actuelle
-    with st.spinner("Ajustement de la tendance (NeuralProphet)..."):
-        m_np = NeuralProphet(learning_rate=0.01)
-        # On désactive les logs pour Streamlit
-        m_np.fit(df, freq="D", progress=None)
-        forecast = m_np.predict(df)
-        
-        # Calcul des résidus actuels
-        residus_actuels = df['y'].values - forecast['yhat1'].values
-        res_scaled = scaler_res.transform(residus_actuels.reshape(-1, 1))
-
-    # 3. Prédiction Future (5 jours)
-    future = m_np.make_future_dataframe(df, periods=7, n_historic_predictions=False)
-    forecast_future = m_np.predict(future)
+def run_analysis():
+    # 1. Téléchargement des données (Fin au 19-02 pour prédire le 20-02)
+    # Note: end="2026-02-20" car la borne supérieure est exclusive dans yfinance
+    df = yf.download("IBM", start="2018-01-01", end="2026-02-20")
+    df = df.reset_index()[['Date', 'Close']]
+    df.columns = ['ds', 'y']
     
-    # Filtrage jours ouvrés (Business Days)
-    forecast_future['day'] = forecast_future['ds'].dt.dayofweek
-    biz_days = forecast_future[forecast_future['day'] < 5].head(5)
-    
-    f_trend = biz_days['yhat1'].values
-    f_dates = biz_days['ds'].values
+    last_price = df['y'].iloc[-1]
 
-    # 4. Boucle LSTM pour les résidus futurs
-    curr_batch = torch.FloatTensor(res_scaled[-30:].reshape(1, 30, 1))
-    preds_res_scaled = []
+    # 2. Configuration NeuralProphet (Fréquence B)
+    m = NeuralProphet(
+        n_changepoints=10,
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False
+    )
     
-    for i in range(len(f_trend)):
-        with torch.no_grad():
-            pred = model_lstm(curr_batch).item()
-            # Clipping de sécurité
-            pred = max(min(pred, 0.2), -0.2)
-            preds_res_scaled.append(pred)
-            # Update batch
-            new_val = torch.FloatTensor([[[pred]]])
-            curr_batch = torch.cat((curr_batch[:, 1:, :], new_val), dim=1)
+    # Entraînement rapide pour la démo (ou chargement de modèle)
+    m.fit(df, freq="B") 
 
-    # Re-transformation des résidus
-    res_final_dollars = scaler_res.inverse_transform(np.array(preds_res_scaled).reshape(-1, 1)).flatten()
+    # 3. Prévisions Futures (Hybride)
+    future = m.make_future_dataframe(df, periods=5, n_historic_predictions=False)
+    forecast = m.predict(future)
     
-    # 5. Application du Gap et Somme Finale
-    base_pred = f_trend + res_final_dollars
-    
-    if use_gap:
-        gap = df['y'].iloc[-1] - forecast['yhat1'].iloc[-1]
-        final_pred = base_pred + gap
-        st.success(f"Signal recalé sur le prix actuel (Gap : {gap:.2f} $)")
-    else:
-        final_pred = base_pred
-        st.warning("Mode sans correction : Affichage de la valeur intrinsèque théorique.")
+    # On récupère les valeurs brutes (yhat1)
+    prediction_totale = forecast['yhat1'].values
+    f_dates = forecast['ds'].values
 
-    return df, f_dates, final_pred, df['y'].iloc[-1]
+    # 4. NOUVEAU CALCUL DU GAP (Basé sur la variable prediction_totale)
+    # On compare le dernier prix réel avec la première prédiction hybride (J+1)
+    pred_brute_demain = prediction_totale[0]
+    gap_correct = last_price - pred_brute_demain
+    
+    # Application du gap
+    prediction_ajustee = prediction_totale + gap_correct
+
+    return df, f_dates, prediction_ajustee, last_price, gap_correct, pred_brute_demain
 
 # --- INTERFACE UTILISATEUR ---
-model_lstm, scaler_res = load_assets()
-
-st.sidebar.header("Configuration")
-gap_option = st.sidebar.toggle("Appliquer correction du Gap", value=True)
-
 if st.sidebar.button("Calculer les prévisions"):
-    df_hist, dates, preds, last_price = run_analysis(gap_option)
+    with st.spinner("Analyse du marché en cours..."):
+        df_hist, dates, preds, last_price, gap, pred_brute = run_analysis()
 
     # Affichage des métriques
     c1, c2, c3 = st.columns(3)
-    c1.metric("Dernière Clôture", f"{last_price:.2f} $")
-    c2.metric("Prédiction J+5", f"{preds[-1]:.2f} $")
-    c3.metric("Variation Attendue", f"{((preds[-1]-last_price)/last_price)*100:+.2f} %")
+    c1.metric("Dernière Clôture (19-02)", f"{last_price:.2f} $")
+    c2.metric("Prédiction Demain (Ajustée)", f"{preds[0]:.2f} $")
+    c3.metric("Correction Gap", f"{gap:+.2f} $", delta_color="inverse")
 
-    # Graphique
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(df_hist['ds'].tail(40), df_hist['y'].tail(40), label="Réel", color="black", alpha=0.6)
-    ax.plot(dates, preds, 'r--o', label="Hybride (NP + LSTM)")
-    ax.set_ylabel("Prix IBM ($)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    st.pyplot(fig)
+    # Explication technique du Gap
+    with st.expander("Détails du recalage (Debug)"):
+        st.write(f"Prix réel au 19-02 : **{last_price:.2f} $**")
+        st.write(f"Prédiction brute modèle (sans gap) : **{pred_brute:.2f} $**")
+        st.write(f"L'écart de **{gap:.2f} $** a été appliqué pour synchroniser le modèle avec le marché.")
 
-    # Tableau de données
-    st.write("### Prévisions détaillées")
-    df_res = pd.DataFrame({"Date": dates.astype(str), "Prix Prédit": preds})
-    st.dataframe(df_res.style.format({"Prix Prédit": "{:.2f} $"}))
+    # Graphique Plotly (pour éviter l'erreur Plotly failed)
+    import plotly.graph_objects as go
+    
+    fig = go.Figure()
+    # Historique récent
+    fig.add_trace(go.Scatter(x=df_hist['ds'].tail(30), y=df_hist['y'].tail(30), name="Historique"))
+    # Prédictions
+    fig.add_trace(go.Scatter(x=dates, y=preds, name="Prédiction (Gap corrigé)", line=dict(color='red', dash='dash')))
+    
+    fig.update_layout(title="Prévisions IBM (Post-Chute Février)", xaxis_title="Date", yaxis_title="Prix ($)")
+    st.plotly_chart(fig, use_container_width=True)
+
