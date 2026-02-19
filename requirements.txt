@@ -1,5 +1,7 @@
 streamlit
-neuralprophet==0.6.2
+neuralprophet==0.8.0
+lightning==2.0.0
+setuptools
 torch --index-url https://download.pytorch.org/whl/cpu
 yfinance
 pandas
